@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__shellagent__*"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__shellagent__run|mcp__shellagent__term_send",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-dangerous.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__shellagent__replace|mcp__shellagent__insert_after|mcp__shellagent__bulk_insert|mcp__shellagent__delete_lines",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-edit-reminder.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/stop-checkpoint.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

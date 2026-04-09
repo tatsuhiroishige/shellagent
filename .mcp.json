@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "shellagent": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "scripts/mcp_server.py"],
+      "env": {
+        "SHELLAGENT_MODE": "local",
+        "SHELLAGENT_SESSION": "shellagent",
+        "SHELLAGENT_WORKDIR": "/Users/tatsu"
+      }
+    }
+  }
+}
