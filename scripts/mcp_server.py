@@ -1496,6 +1496,160 @@ def log_tail(n: int = 20) -> str:
 
 
 # ──────────────────────────────────────────────
+# tmux Primitives (raw access)
+# ──────────────────────────────────────────────
+
+
+def _resolve_target(target: str) -> str:
+    """Resolve a target: 'main' -> main pane, named pane -> pane_id, or raw tmux target."""
+    if target == "main":
+        return transport.main_pane()
+    pane_id = _pane_registry.get(target)
+    if pane_id:
+        return pane_id
+    return f"{transport.session_name()}:{target}"
+
+
+@mcp.tool()
+def send_keys(target: str, keys: str) -> str:
+    """Send raw tmux keys to any pane.
+    Args:
+        target: 'main', a named pane, or a raw tmux target (e.g. 'shellagent:main.1')
+        keys: tmux key string (e.g. 'C-c', 'Escape', 'Enter', 'C-l', or literal text)
+    """
+    t = _resolve_target(target)
+    transport.send_keys(t, keys)
+    return f"Sent keys '{keys}' to {target}"
+
+
+@mcp.tool()
+def capture(target: str = "main", lines: int = 50) -> str:
+    """Capture text output from any pane.
+    Args:
+        target: 'main', a named pane, or raw tmux target
+        lines: number of lines to capture from bottom (default 50)
+    """
+    t = _resolve_target(target)
+    return transport.capture(t, lines)
+
+
+@mcp.tool()
+def scrollback(target: str = "main", lines: int = 2000) -> str:
+    """Capture full scrollback buffer from any pane (not just visible area).
+    Args:
+        target: 'main', a named pane, or raw tmux target
+        lines: max lines to capture (default 2000)
+    """
+    t = _resolve_target(target)
+    r = subprocess.run(
+        ["tmux", "capture-pane", "-t", t, "-p", "-S", f"-{lines}", "-J"],
+        capture_output=True, text=True, timeout=10,
+    )
+    return r.stdout
+
+
+@mcp.tool()
+def pane_zoom(target: str = "main") -> str:
+    """Toggle zoom (fullscreen) on a pane.
+    Args:
+        target: 'main', a named pane, or raw tmux target
+    """
+    t = _resolve_target(target)
+    subprocess.run(["tmux", "resize-pane", "-t", t, "-Z"], check=False)
+    return f"Toggled zoom on {target}"
+
+
+@mcp.tool()
+def pane_resize(name: str, direction: str, amount: int = 10) -> str:
+    """Resize a named pane.
+    Args:
+        name: pane name from pane_split
+        direction: 'left', 'right', 'up', 'down'
+        amount: number of cells to resize (default 10)
+    """
+    target = _pane_target(name)
+    if not target:
+        return f"ERROR: Pane '{name}' not found"
+    flag = {"left": "-L", "right": "-R", "up": "-U", "down": "-D"}.get(direction)
+    if not flag:
+        return f"ERROR: direction must be left/right/up/down"
+    subprocess.run(
+        ["tmux", "resize-pane", "-t", target, flag, str(amount)],
+        check=False,
+    )
+    return f"Resized '{name}' {direction} by {amount}"
+
+
+@mcp.tool()
+def pane_swap(name1: str, name2: str) -> str:
+    """Swap the positions of two named panes.
+    Args:
+        name1: first pane name
+        name2: second pane name
+    """
+    t1 = _pane_target(name1)
+    t2 = _pane_target(name2)
+    if not t1:
+        return f"ERROR: Pane '{name1}' not found"
+    if not t2:
+        return f"ERROR: Pane '{name2}' not found"
+    subprocess.run(
+        ["tmux", "swap-pane", "-s", t1, "-t", t2],
+        check=False,
+    )
+    return f"Swapped '{name1}' and '{name2}'"
+
+
+@mcp.tool()
+def wait_for_idle(target: str = "main", timeout: int = 30) -> str:
+    """Wait until a pane becomes idle (shell prompt).
+    Args:
+        target: 'main', a named pane, or raw tmux target
+        timeout: max seconds to wait (default 30)
+    Returns: 'idle' or 'timeout'
+    """
+    t = _resolve_target(target)
+    for _ in range(timeout * 5):
+        if not transport.is_busy(t):
+            return "idle"
+        time.sleep(0.2)
+    return "timeout"
+
+
+@mcp.tool()
+def pipe_log(name: str, log_file: str) -> str:
+    """Start piping a named pane's output to a file (real-time logging).
+    Call pipe_log_stop() to stop.
+    Args:
+        name: pane name
+        log_file: absolute path to write output to
+    """
+    target = _pane_target(name)
+    if not target:
+        return f"ERROR: Pane '{name}' not found"
+    full = os.path.expanduser(log_file)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    subprocess.run(
+        ["tmux", "pipe-pane", "-t", target, f"cat >> {full}"],
+        check=False,
+    )
+    return f"Piping '{name}' output to {full}"
+
+
+@mcp.tool()
+def pipe_log_stop(name: str) -> str:
+    """Stop piping a pane's output to file."""
+    target = _pane_target(name)
+    if not target:
+        return f"ERROR: Pane '{name}' not found"
+    subprocess.run(
+        ["tmux", "pipe-pane", "-t", target],  # empty command = stop
+        check=False,
+    )
+    return f"Stopped piping '{name}'"
+
+
+# ──────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────
 
