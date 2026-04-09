@@ -37,7 +37,6 @@ from mcp.server.fastmcp import FastMCP
 # ──────────────────────────────────────────────
 
 MODE = os.environ.get("SHELLAGENT_MODE", "local")  # "local" or "remote"
-DELAY_MODE = os.environ.get("SHELLAGENT_DELAY", "normal")  # "instant", "normal", "slow"
 LOG_DIR = os.environ.get("SHELLAGENT_LOG_DIR", os.path.expanduser("~/.shellagent/logs"))
 
 # Local mode settings
@@ -87,20 +86,6 @@ class OpLogger:
 
 op_logger = OpLogger(LOG_DIR)
 
-
-# ──────────────────────────────────────────────
-# Human-like Delay
-# ──────────────────────────────────────────────
-
-# Delay multiplier: instant=0, normal=1x, slow=3x
-DELAY_MULTIPLIER = {"instant": 0.0, "normal": 1.0, "slow": 3.0}.get(DELAY_MODE, 1.0)
-
-
-def human_delay(base_seconds: float = 0.1):
-    """Sleep with human-like delay scaling."""
-    actual = base_seconds * DELAY_MULTIPLIER
-    if actual > 0:
-        time.sleep(actual)
 
 
 # ──────────────────────────────────────────────
@@ -220,15 +205,15 @@ class Transport(ABC):
     def send_cmd(self, target: str, cmd: str):
         """Send a command string with Enter."""
         self.send_literal(target, cmd)
-        human_delay(0.05)
+        time.sleep(0.05)
         self.send_keys(target, "Enter")
 
     def escape_to_normal(self, target: str):
         """Send Escape twice to reliably enter normal mode."""
         self.send_keys(target, "Escape")
-        human_delay(0.1)
+        time.sleep(0.1)
         self.send_keys(target, "Escape")
-        human_delay(0.1)
+        time.sleep(0.1)
 
     def ensure_nvim(self, target: str):
         """Start nvim if not already running."""
@@ -788,36 +773,32 @@ else:
 mcp = FastMCP("shellagent")
 
 
-# ── Logging wrapper: auto-log all tool calls ──
-_original_tool = mcp.tool
+# ── Logging: hook into FastMCP's call_tool ──
+_original_call_tool = mcp._tool_manager.call_tool.__func__ if hasattr(mcp._tool_manager.call_tool, '__func__') else None
 
 
-def _logged_tool(*tool_args, **tool_kwargs):
-    """Wrap mcp.tool() to auto-log every call with timing."""
-    decorator = _original_tool(*tool_args, **tool_kwargs)
-
-    def wrapper(fn):
-        registered = decorator(fn)
-
-        @wraps(fn)
-        def logged_fn(*args, **kwargs):
-            t0 = time.time()
-            try:
-                result = fn(*args, **kwargs)
-                duration = int((time.time() - t0) * 1000)
-                op_logger.log(fn.__name__, kwargs or dict(zip(fn.__code__.co_varnames, args)), str(result), duration)
-                return result
-            except Exception as e:
-                duration = int((time.time() - t0) * 1000)
-                op_logger.log(fn.__name__, kwargs or {}, f"ERROR: {e}", duration)
-                raise
-
-        return logged_fn
-
-    return wrapper
+async def _logged_call_tool(self, name, arguments, **kwargs):
+    """Wrap ToolManager.call_tool to auto-log every MCP call."""
+    t0 = time.time()
+    try:
+        result = await _original_call_tool(self, name, arguments, **kwargs) if _original_call_tool else await type(self).call_tool(self, name, arguments, **kwargs)
+        duration = int((time.time() - t0) * 1000)
+        result_text = ""
+        if result:
+            for item in result:
+                if hasattr(item, 'text'):
+                    result_text += item.text
+        op_logger.log(name, arguments or {}, result_text, duration)
+        return result
+    except Exception as e:
+        duration = int((time.time() - t0) * 1000)
+        op_logger.log(name, arguments or {}, f"ERROR: {e}", duration)
+        raise
 
 
-mcp.tool = _logged_tool
+# Monkey-patch the tool manager
+import types
+mcp._tool_manager.call_tool = types.MethodType(_logged_call_tool, mcp._tool_manager)
 
 
 # ──────────────────────────────────────────────
@@ -833,18 +814,25 @@ def init() -> str:
 
 @mcp.tool()
 def status() -> str:
-    """Show session status: windows, pane states, and current processes."""
+    """Show session status: all windows, all panes, and their processes."""
+    session = transport.session_name()
     windows = transport.list_windows()
-    pane = transport.main_pane()
-    busy = transport.is_busy(pane)
-    nvim = transport.is_nvim_running(pane)
+
+    # Get detailed pane info for all panes in the session
+    r = subprocess.run(
+        ["tmux", "list-panes", "-t", session, "-a",
+         "-F", "#{window_name}:#{pane_index} #{pane_id} #{pane_width}x#{pane_height} #{pane_current_command}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    pane_info = r.stdout.strip() if r.returncode == 0 else "(unable to list panes)"
+
     return (
-        f"Session: {transport.session_name()}\n"
+        f"Session: {session}\n"
         f"Mode: {MODE}\n"
         f"Workdir: {transport.workdir()}\n"
-        f"Main pane busy: {busy}\n"
-        f"nvim running: {nvim}\n"
-        f"\nWindows:\n{windows}"
+        f"Log: {op_logger.log_path}\n"
+        f"\nWindows:\n{windows}\n"
+        f"Panes:\n{pane_info}"
     )
 
 
@@ -1449,9 +1437,19 @@ def layout(preset: str = "dev") -> str:
         multi: main (50%) | agent-1 top + agent-2 bottom (50%)
         reset: close all extra panes, back to single main
     """
-    # Clean up existing named panes first (except for 'reset' which is the whole point)
-    for name in list(_pane_registry.keys()):
-        pane_close(name)
+    # Clean up: close ALL panes except pane index 0 in main window
+    session = transport.session_name()
+    r = subprocess.run(
+        ["tmux", "list-panes", "-t", f"{session}:main",
+         "-F", "#{pane_id} #{pane_index}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if r.returncode == 0:
+        for line in r.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] != "0":
+                subprocess.run(["tmux", "kill-pane", "-t", parts[0]], check=False)
+    _pane_registry.clear()
 
     _focus_window("main")
 

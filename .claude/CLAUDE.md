@@ -81,7 +81,6 @@ tmux上で動作する透明・低コストなAIエージェント基盤。
 | `SHELLAGENT_MODE` | `local` | `local` or `remote` |
 | `SHELLAGENT_SESSION` | `shellagent` | tmux session name |
 | `SHELLAGENT_WORKDIR` | `~` | Working directory |
-| `SHELLAGENT_DELAY` | `normal` | `instant`, `normal`, `slow` — human-like delay |
 | `SHELLAGENT_LOG_DIR` | `~/.shellagent/logs` | JSONL operation log directory |
 
 ## Architecture
