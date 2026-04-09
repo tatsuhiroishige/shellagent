@@ -995,6 +995,153 @@ def term_list() -> str:
 
 
 # ──────────────────────────────────────────────
+# Pane Management (split panes for agents)
+# ──────────────────────────────────────────────
+
+# Track named panes: name -> pane_id (e.g. "%5")
+_pane_registry: dict[str, str] = {}
+
+
+def _pane_target(name: str) -> str | None:
+    """Get tmux pane target for a named pane."""
+    pane_id = _pane_registry.get(name)
+    if not pane_id:
+        return None
+    # Verify it still exists
+    r = subprocess.run(
+        ["tmux", "list-panes", "-t", transport.session_name(),
+         "-F", "#{pane_id}", "-a"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if pane_id not in r.stdout.splitlines():
+        del _pane_registry[name]
+        return None
+    return pane_id
+
+
+@mcp.tool()
+def pane_split(name: str, direction: str = "horizontal", size: int = 50) -> str:
+    """Split the main window to create a named pane for an agent.
+    Args:
+        name: Name for the new pane (used to reference it later)
+        direction: 'horizontal' (side by side) or 'vertical' (top/bottom)
+        size: Percentage of space for the new pane (default 50)
+    """
+    if name in _pane_registry and _pane_target(name):
+        return f"Pane '{name}' already exists"
+    flag = "-h" if direction == "horizontal" else "-v"
+    main = transport.main_pane()
+    r = subprocess.run(
+        ["tmux", "split-window", flag, "-t", main,
+         "-p", str(size), "-d",  # -d: don't switch focus
+         "-c", transport.workdir(),
+         "-P", "-F", "#{pane_id}"],  # print new pane id
+        capture_output=True, text=True, timeout=5,
+    )
+    pane_id = r.stdout.strip()
+    if not pane_id:
+        return "ERROR: Failed to split pane"
+    _pane_registry[name] = pane_id
+    return f"Created pane '{name}' ({pane_id}, {direction}, {size}%)"
+
+
+@mcp.tool()
+def pane_send(name: str, cmd: str) -> str:
+    """Send a command to a named pane."""
+    target = _pane_target(name)
+    if not target:
+        return f"ERROR: Pane '{name}' not found"
+    # Write cmd to temp file, load into tmux buffer, paste into pane
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cmd', delete=False) as f:
+        f.write(cmd)
+        tmpfile = f.name
+    subprocess.run(
+        ["tmux", "load-buffer", "-b", "sa_cmd", tmpfile],
+        check=False,
+    )
+    os.unlink(tmpfile)
+    subprocess.run(
+        ["tmux", "paste-buffer", "-b", "sa_cmd", "-t", target, "-d"],
+        check=False,
+    )
+    transport.send_keys(target, "Enter")
+    return f"Sent to '{name}': {cmd}"
+
+
+@mcp.tool()
+def pane_output(name: str, lines: int = 50) -> str:
+    """Capture recent output from a named pane."""
+    target = _pane_target(name)
+    if not target:
+        return f"ERROR: Pane '{name}' not found"
+    return transport.capture(target, lines)
+
+
+@mcp.tool()
+def pane_busy(name: str) -> bool:
+    """Check if a named pane has a running process."""
+    target = _pane_target(name)
+    if not target:
+        return False
+    return transport.is_busy(target)
+
+
+@mcp.tool()
+def pane_kill(name: str) -> str:
+    """Send Ctrl+C to a named pane."""
+    target = _pane_target(name)
+    if not target:
+        return f"ERROR: Pane '{name}' not found"
+    transport.send_keys(target, "C-c")
+    return f"Sent Ctrl+C to '{name}'"
+
+
+@mcp.tool()
+def pane_close(name: str) -> str:
+    """Close a named pane."""
+    target = _pane_target(name)
+    if not target:
+        return f"Pane '{name}' not found (already closed?)"
+    subprocess.run(
+        ["tmux", "kill-pane", "-t", target],
+        check=False,
+    )
+    _pane_registry.pop(name, None)
+    return f"Closed pane '{name}'"
+
+
+@mcp.tool()
+def pane_focus(name: str) -> str:
+    """Switch tmux focus to a named pane."""
+    target = _pane_target(name)
+    if not target:
+        return f"ERROR: Pane '{name}' not found"
+    subprocess.run(
+        ["tmux", "select-pane", "-t", target],
+        check=False,
+    )
+    return f"Focused on pane '{name}'"
+
+
+@mcp.tool()
+def pane_list() -> str:
+    """List all named panes and their status."""
+    if not _pane_registry:
+        return "No named panes"
+    lines = []
+    for name, pane_id in list(_pane_registry.items()):
+        target = _pane_target(name)
+        if target:
+            busy = transport.is_busy(target)
+            status = "busy" if busy else "idle"
+            lines.append(f"  {name}: {pane_id} [{status}]")
+        else:
+            lines.append(f"  {name}: (dead)")
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
 # Browser (w3m)
 # ──────────────────────────────────────────────
 
