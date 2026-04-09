@@ -74,6 +74,16 @@ tmux上で動作する透明・低コストなAIエージェント基盤。
 - **PostToolUse**: 編集系 → `post-edit-reminder.sh` (commit_edit忘れ防止)
 - **Stop**: タスク完了チェックポイント
 
+## Environment Variables
+
+| Var | Default | Description |
+|-----|---------|-------------|
+| `SHELLAGENT_MODE` | `local` | `local` or `remote` |
+| `SHELLAGENT_SESSION` | `shellagent` | tmux session name |
+| `SHELLAGENT_WORKDIR` | `~` | Working directory |
+| `SHELLAGENT_DELAY` | `normal` | `instant`, `normal`, `slow` — human-like delay |
+| `SHELLAGENT_LOG_DIR` | `~/.shellagent/logs` | JSONL operation log directory |
+
 ## Architecture
 
 ```
@@ -84,4 +94,22 @@ Claude Code → MCP Server (shellagent)
             └── RemoteTransport (LOCAL_PANE中継 + SSH)
                 ↓
             tmux session (人間が監視)
+                ↓
+            Operation Logger (JSONL自動記録)
 ```
+
+## Layout Presets
+| Preset | Description |
+|--------|-------------|
+| `layout("dev")` | main (60%) \| terminal (40%) |
+| `layout("review")` | main (60%) \| diff + log (40%) |
+| `layout("multi")` | main (50%) \| agent-1 + agent-2 (50%) |
+| `layout("reset")` | 全ペイン閉じてmainのみ |
+
+## Operation Log
+| Tool | Description |
+|------|-------------|
+| `log_path()` | 現セッションのログファイルパス |
+| `log_tail(n)` | 直近n件のログエントリ表示 |
+
+ログ形式: JSONL (seq, ts, tool, args, result, duration_ms)

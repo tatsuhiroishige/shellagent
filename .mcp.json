@@ -7,7 +7,8 @@
       "env": {
         "SHELLAGENT_MODE": "local",
         "SHELLAGENT_SESSION": "shellagent",
-        "SHELLAGENT_WORKDIR": "/Users/tatsu"
+        "SHELLAGENT_WORKDIR": "/Users/tatsu",
+        "SHELLAGENT_DELAY": "normal"
       }
     }
   }

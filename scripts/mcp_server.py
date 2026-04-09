@@ -18,12 +18,17 @@ Usage:
     Claude Code launches this automatically via stdio transport.
 """
 
+import json
+import logging
 import os
 import shlex
 import subprocess
 import time
 import re
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
@@ -32,6 +37,8 @@ from mcp.server.fastmcp import FastMCP
 # ──────────────────────────────────────────────
 
 MODE = os.environ.get("SHELLAGENT_MODE", "local")  # "local" or "remote"
+DELAY_MODE = os.environ.get("SHELLAGENT_DELAY", "normal")  # "instant", "normal", "slow"
+LOG_DIR = os.environ.get("SHELLAGENT_LOG_DIR", os.path.expanduser("~/.shellagent/logs"))
 
 # Local mode settings
 LOCAL_SESSION = os.environ.get("SHELLAGENT_SESSION", "shellagent")
@@ -45,6 +52,71 @@ REMOTE_VIEW_PANE = os.environ.get("SHELLAGENT_REMOTE_VIEW_PANE", "myserver:view.
 REMOTE_TMUX_PREFIX = os.environ.get("SHELLAGENT_REMOTE_TMUX_PREFIX", "C-b")
 
 IDLE_SHELLS = ("bash", "zsh", "sh", "tcsh", "csh", "fish")
+
+
+# ──────────────────────────────────────────────
+# Operation Logger — structured JSONL logging
+# ──────────────────────────────────────────────
+
+class OpLogger:
+    """Logs all MCP tool calls to JSONL files."""
+
+    def __init__(self, log_dir: str):
+        self._log_dir = Path(log_dir)
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._log_file = self._log_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+        self._seq = 0
+
+    def log(self, tool: str, args: dict, result: str, duration_ms: int):
+        self._seq += 1
+        entry = {
+            "seq": self._seq,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "tool": tool,
+            "args": args,
+            "result": result[:500] if isinstance(result, str) else str(result)[:500],
+            "duration_ms": duration_ms,
+        }
+        with open(self._log_file, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    @property
+    def log_path(self) -> str:
+        return str(self._log_file)
+
+
+op_logger = OpLogger(LOG_DIR)
+
+
+# ──────────────────────────────────────────────
+# Human-like Delay
+# ──────────────────────────────────────────────
+
+# Delay multiplier: instant=0, normal=1x, slow=3x
+DELAY_MULTIPLIER = {"instant": 0.0, "normal": 1.0, "slow": 3.0}.get(DELAY_MODE, 1.0)
+
+
+def human_delay(base_seconds: float = 0.1):
+    """Sleep with human-like delay scaling."""
+    actual = base_seconds * DELAY_MULTIPLIER
+    if actual > 0:
+        time.sleep(actual)
+
+
+# ──────────────────────────────────────────────
+# Window Focus Helper
+# ──────────────────────────────────────────────
+
+def _focus_window(name: str):
+    """Switch tmux focus to the named window so the user can see it."""
+    try:
+        session = LOCAL_SESSION if MODE == "local" else REMOTE_SESSION
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{session}:{name}"],
+            check=False, timeout=5,
+        )
+    except Exception:
+        pass
 
 
 # ──────────────────────────────────────────────
@@ -148,14 +220,15 @@ class Transport(ABC):
     def send_cmd(self, target: str, cmd: str):
         """Send a command string with Enter."""
         self.send_literal(target, cmd)
+        human_delay(0.05)
         self.send_keys(target, "Enter")
 
     def escape_to_normal(self, target: str):
         """Send Escape twice to reliably enter normal mode."""
         self.send_keys(target, "Escape")
-        time.sleep(0.1)
+        human_delay(0.1)
         self.send_keys(target, "Escape")
-        time.sleep(0.1)
+        human_delay(0.1)
 
     def ensure_nvim(self, target: str):
         """Start nvim if not already running."""
@@ -715,6 +788,38 @@ else:
 mcp = FastMCP("shellagent")
 
 
+# ── Logging wrapper: auto-log all tool calls ──
+_original_tool = mcp.tool
+
+
+def _logged_tool(*tool_args, **tool_kwargs):
+    """Wrap mcp.tool() to auto-log every call with timing."""
+    decorator = _original_tool(*tool_args, **tool_kwargs)
+
+    def wrapper(fn):
+        registered = decorator(fn)
+
+        @wraps(fn)
+        def logged_fn(*args, **kwargs):
+            t0 = time.time()
+            try:
+                result = fn(*args, **kwargs)
+                duration = int((time.time() - t0) * 1000)
+                op_logger.log(fn.__name__, kwargs or dict(zip(fn.__code__.co_varnames, args)), str(result), duration)
+                return result
+            except Exception as e:
+                duration = int((time.time() - t0) * 1000)
+                op_logger.log(fn.__name__, kwargs or {}, f"ERROR: {e}", duration)
+                raise
+
+        return logged_fn
+
+    return wrapper
+
+
+mcp.tool = _logged_tool
+
+
 # ──────────────────────────────────────────────
 # Session Management
 # ──────────────────────────────────────────────
@@ -788,6 +893,7 @@ def run_kill() -> str:
 @mcp.tool()
 def open_file(path: str) -> str:
     """Open file in nvim. Accepts absolute (~/ or /) or relative (to workdir) paths."""
+    _focus_window("main")
     full = transport.resolve_path(path)
     transport.nvim_cmd(transport.main_pane(), f"e {full}")
     return f"Opened {full}"
@@ -1184,14 +1290,6 @@ def _ensure_browse_window():
         time.sleep(0.3)
 
 
-def _focus_window(name: str):
-    """Switch tmux focus to the named window so the user can see it."""
-    subprocess.run(
-        ["tmux", "select-window", "-t", f"{transport.session_name()}:{name}"],
-        check=False,
-    )
-
-
 @mcp.tool()
 def browse_open(url: str) -> str:
     """Open a URL in the browser (w3m in a dedicated tmux window).
@@ -1335,6 +1433,68 @@ def browse_close() -> str:
     transport.close_window(BROWSE_WINDOW)
     _focus_window("main")
     return "Browser closed"
+
+
+# ──────────────────────────────────────────────
+# Layout Presets
+# ──────────────────────────────────────────────
+
+
+@mcp.tool()
+def layout(preset: str = "dev") -> str:
+    """Apply a tmux pane layout preset.
+    Presets:
+        dev:   main (60%) | terminal (40%)
+        review: main (60%) | diff top + log bottom (40%)
+        multi: main (50%) | agent-1 top + agent-2 bottom (50%)
+        reset: close all extra panes, back to single main
+    """
+    # Clean up existing named panes first (except for 'reset' which is the whole point)
+    for name in list(_pane_registry.keys()):
+        pane_close(name)
+
+    _focus_window("main")
+
+    if preset == "reset":
+        return "Layout reset to single main pane"
+
+    if preset == "dev":
+        pane_split("terminal", direction="horizontal", size=40)
+        return "Layout: dev (main | terminal)"
+
+    if preset == "review":
+        pane_split("diff", direction="horizontal", size=40)
+        pane_split("log", direction="vertical", size=50)
+        return "Layout: review (main | diff + log)"
+
+    if preset == "multi":
+        pane_split("agent-1", direction="horizontal", size=50)
+        pane_split("agent-2", direction="vertical", size=50)
+        return "Layout: multi (main | agent-1 + agent-2)"
+
+    return f"ERROR: Unknown preset '{preset}'. Use: dev, review, multi, reset"
+
+
+# ──────────────────────────────────────────────
+# Operation Log Access
+# ──────────────────────────────────────────────
+
+
+@mcp.tool()
+def log_path() -> str:
+    """Get the path to the current session's operation log file."""
+    return op_logger.log_path
+
+
+@mcp.tool()
+def log_tail(n: int = 20) -> str:
+    """Show the last n entries from the operation log."""
+    try:
+        with open(op_logger.log_path, "r") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except FileNotFoundError:
+        return "No log entries yet"
 
 
 # ──────────────────────────────────────────────
