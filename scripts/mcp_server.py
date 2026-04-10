@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp[cli]"]
+# dependencies = ["mcp[cli]", "playwright"]
 # ///
 """
 shellagent MCP Server — Local & Remote tmux-based agent infrastructure
@@ -1421,6 +1421,401 @@ def browse_close() -> str:
     transport.close_window(BROWSE_WINDOW)
     _focus_window("main")
     return "Browser closed"
+
+
+# ──────────────────────────────────────────────
+# Playwright Browser (headless Chromium + tmux display)
+# ──────────────────────────────────────────────
+
+PW_WINDOW = "pwbrowse"
+PW_SCREENSHOT_DIR = os.path.expanduser("~/.shellagent/screenshots")
+PW_LOG_FILE = os.path.expanduser("~/.shellagent/pw_browse.log")
+
+
+class PlaywrightBrowser:
+    """Manages a headless Chromium browser with tmux-based visual feedback.
+
+    Two-pane tmux window:
+      Left (65%):  Screenshot display via chafa (updated after each action)
+      Right (35%): Real-time operation log
+
+    Uses async Playwright API (required by FastMCP's async event loop).
+    """
+
+    def __init__(self):
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._view_pane = None  # left pane — screenshot display
+        self._log_pane = None   # right pane — operation log
+        self._screenshot_seq = 0
+
+    @property
+    def started(self) -> bool:
+        return self._page is not None
+
+    async def _ensure_started(self):
+        """Launch browser on first use (lazy init)."""
+        if self._page is not None:
+            return
+        from playwright.async_api import async_playwright
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        self._context = await self._browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/145.0.0.0 Safari/537.36"
+            ),
+        )
+        self._page = await self._context.new_page()
+        os.makedirs(PW_SCREENSHOT_DIR, exist_ok=True)
+
+    def _pw_window_exists(self) -> bool:
+        """Check if the pwbrowse window exists."""
+        r = subprocess.run(
+            ["tmux", "list-windows", "-t", transport.session_name(),
+             "-F", "#{window_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return PW_WINDOW in r.stdout.splitlines()
+
+    def _ensure_window(self):
+        """Create the 2-pane tmux window if it doesn't exist. Reuse if it does."""
+        session = transport.session_name()
+
+        if self._pw_window_exists():
+            # Window exists — reconnect pane references if needed
+            if not self._view_pane or not self._log_pane:
+                r = subprocess.run(
+                    ["tmux", "list-panes", "-t", f"{session}:{PW_WINDOW}",
+                     "-F", "#{pane_id} #{pane_index}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                panes = r.stdout.strip().splitlines()
+                if len(panes) >= 2:
+                    for line in panes:
+                        pid, idx = line.split()
+                        if idx == "0":
+                            self._view_pane = pid
+                        else:
+                            self._log_pane = pid
+                elif len(panes) == 1:
+                    self._view_pane = panes[0].split()[0]
+                    r2 = subprocess.run(
+                        ["tmux", "split-window", "-v",
+                         "-t", self._view_pane,
+                         "-p", "25", "-d", "-P", "-F", "#{pane_id}"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self._log_pane = r2.stdout.strip()
+                # Ensure tail -f is running in the log pane
+                self._ensure_log_tail()
+            return
+
+        # Create new window
+        transport.create_window(PW_WINDOW)
+        time.sleep(0.3)
+        self._view_pane = f"{session}:{PW_WINDOW}.0"
+
+        # Split: bottom pane (25%) for log — screenshot gets full width
+        r = subprocess.run(
+            ["tmux", "split-window", "-v", "-t", self._view_pane,
+             "-p", "25", "-d", "-P", "-F", "#{pane_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        self._log_pane = r.stdout.strip()
+
+        # Initialize log file and start tail -f
+        self._start_log_tail()
+        _focus_window(PW_WINDOW)
+
+    def _start_log_tail(self):
+        """Initialize log file and start tail -f in the log pane."""
+        os.makedirs(os.path.dirname(PW_LOG_FILE), exist_ok=True)
+        with open(PW_LOG_FILE, "w") as f:
+            f.write("=== Playwright Browser Log ===\n")
+        if self._log_pane:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", self._log_pane,
+                 f"tail -f {shlex.quote(PW_LOG_FILE)}", "Enter"],
+                check=False, timeout=5,
+            )
+
+    def _ensure_log_tail(self):
+        """Start tail -f in the log pane if it's not already running."""
+        if not self._log_pane:
+            return
+        # Check what's running in the log pane
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", self._log_pane,
+             "-p", "#{pane_current_command}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        current_cmd = r.stdout.strip()
+        if current_cmd != "tail":
+            # tail is not running — start it
+            os.makedirs(os.path.dirname(PW_LOG_FILE), exist_ok=True)
+            if not os.path.exists(PW_LOG_FILE):
+                with open(PW_LOG_FILE, "w") as f:
+                    f.write("=== Playwright Browser Log ===\n")
+            subprocess.run(
+                ["tmux", "send-keys", "-t", self._log_pane,
+                 f"tail -f {shlex.quote(PW_LOG_FILE)}", "Enter"],
+                check=False, timeout=5,
+            )
+
+    def _send_to_pane(self, pane_target: str, cmd: str):
+        """Send a shell command to a tmux pane."""
+        subprocess.run(
+            ["tmux", "send-keys", "-t", pane_target, cmd, "Enter"],
+            check=False, timeout=5,
+        )
+
+    def _pane_size(self, pane_target: str) -> tuple[int, int]:
+        """Get pane width x height in character cells."""
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", pane_target,
+             "-p", "#{pane_width} #{pane_height}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        parts = r.stdout.strip().split()
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+        return 80, 40  # fallback
+
+    async def _take_screenshot(self) -> str:
+        """Take a screenshot and display it in the left pane via chafa."""
+        if not self._page:
+            return ""
+        self._screenshot_seq += 1
+        path = os.path.join(PW_SCREENSHOT_DIR, f"pw_{self._screenshot_seq:04d}.png")
+        await self._page.screenshot(path=path)
+
+        # Clean up old screenshots (keep last 20)
+        if self._screenshot_seq > 20:
+            old = os.path.join(PW_SCREENSHOT_DIR,
+                               f"pw_{self._screenshot_seq - 20:04d}.png")
+            if os.path.exists(old):
+                os.remove(old)
+
+        # Display in left pane
+        if self._view_pane:
+            w, h = self._pane_size(self._view_pane)
+            self._send_to_pane(
+                self._view_pane,
+                f"clear && chafa -f symbols -c full -w 9 --symbols braille --size {w}x{h} {shlex.quote(path)}",
+            )
+        return path
+
+    def _log_action(self, action: str, detail: str = ""):
+        """Append a log line to the log file (tail -f displays it in the pane)."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        msg = f"[{ts}] {action}"
+        if detail:
+            msg += f" | {detail[:80]}"
+        try:
+            with open(PW_LOG_FILE, "a") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
+
+    async def close(self):
+        """Shut down browser and clean up tmux window."""
+        if self._page:
+            await self._page.close()
+            self._page = None
+        if self._context:
+            await self._context.close()
+            self._context = None
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright:
+            await self._playwright.stop()
+            self._playwright = None
+        # Close tmux window
+        if self._pw_window_exists():
+            transport.close_window(PW_WINDOW)
+        self._view_pane = None
+        self._log_pane = None
+        self._screenshot_seq = 0
+
+
+pw_browser = PlaywrightBrowser()
+
+
+def _format_a11y_tree(node: dict | None, indent: int = 0) -> str:
+    """Format an accessibility snapshot into readable indented text."""
+    if not node:
+        return "(empty)"
+    lines = []
+    prefix = "  " * indent
+    role = node.get("role", "")
+    name = node.get("name", "")
+    value = node.get("value", "")
+
+    parts = [role]
+    if name:
+        parts.append(f'"{name}"')
+    if value:
+        parts.append(f'[value: "{value}"]')
+    lines.append(f"{prefix}- {' '.join(parts)}")
+
+    for child in node.get("children", []):
+        lines.append(_format_a11y_tree(child, indent + 1))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def pw_open(url: str) -> str:
+    """Open a URL in the Playwright browser (headless Chromium).
+    The page screenshot is displayed in real-time in the 'pwbrowse' tmux window.
+    Use pw_text() or pw_accessibility() to read the content."""
+    await pw_browser._ensure_started()
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    await pw_browser._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    title = await pw_browser._page.title()
+    result = f"Opened {url} — {title}"
+    pw_browser._log_action("open", result[:80])
+    await pw_browser._take_screenshot()
+    return result
+
+
+@mcp.tool()
+async def pw_click(selector: str) -> str:
+    """Click an element by CSS selector.
+    Examples: '#login-btn', 'button:has-text("Submit")', '.nav a:first-child'"""
+    await pw_browser._ensure_started()
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    await pw_browser._page.click(selector, timeout=10000)
+    result = f"Clicked {selector}"
+    pw_browser._log_action("click", selector[:80])
+    await pw_browser._take_screenshot()
+    return result
+
+
+@mcp.tool()
+async def pw_type(selector: str, text: str, clear: bool = True) -> str:
+    """Type text into an input field.
+    Args:
+        selector: CSS selector for the input element
+        text: text to type
+        clear: if True, clear the field first (default True)
+    """
+    await pw_browser._ensure_started()
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    if clear:
+        await pw_browser._page.fill(selector, text, timeout=10000)
+    else:
+        await pw_browser._page.type(selector, text, timeout=10000)
+    result = f"Typed into {selector}"
+    pw_browser._log_action("type", f"{selector} <- {text[:40]}")
+    await pw_browser._take_screenshot()
+    return result
+
+
+@mcp.tool()
+async def pw_scroll(direction: str = "down", amount: int = 500) -> str:
+    """Scroll the page.
+    Args:
+        direction: 'down' or 'up'
+        amount: pixels to scroll (default 500)
+    """
+    await pw_browser._ensure_started()
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    delta = amount if direction == "down" else -amount
+    await pw_browser._page.mouse.wheel(0, delta)
+    await pw_browser._page.wait_for_timeout(300)
+    result = f"Scrolled {direction} {amount}px"
+    pw_browser._log_action("scroll", result)
+    await pw_browser._take_screenshot()
+    return result
+
+
+@mcp.tool()
+async def pw_text() -> str:
+    """Get the visible text content of the current page.
+    Returns the text like w3m -dump but with full JS support."""
+    if not pw_browser.started:
+        return "ERROR: Browser not open. Call pw_open(url) first."
+    return await pw_browser._page.inner_text("body")
+
+
+@mcp.tool()
+async def pw_accessibility() -> str:
+    """Get the accessibility tree of the current page.
+    Returns structured text showing headings, links, buttons, inputs, etc.
+    Best way for AI to understand page structure."""
+    if not pw_browser.started:
+        return "ERROR: Browser not open. Call pw_open(url) first."
+    return await pw_browser._page.locator("body").aria_snapshot()
+
+
+@mcp.tool()
+async def pw_screenshot() -> str:
+    """Manually trigger a screenshot update in the tmux display.
+    (Screenshots are also taken automatically after every action.)"""
+    await pw_browser._ensure_started()
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    pw_browser._log_action("screenshot", "manual")
+    await pw_browser._take_screenshot()
+    return "Screenshot updated"
+
+
+@mcp.tool()
+async def pw_eval(js: str) -> str:
+    """Execute JavaScript in the browser and return the result.
+    Example: pw_eval('document.querySelectorAll("a").length')"""
+    if not pw_browser.started:
+        return "ERROR: Browser not open. Call pw_open(url) first."
+    pw_browser._ensure_window()
+    result = await pw_browser._page.evaluate(js)
+    pw_browser._log_action("eval", js[:60])
+    await pw_browser._take_screenshot()
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+async def pw_back() -> str:
+    """Navigate back to the previous page."""
+    await pw_browser._ensure_started()
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    await pw_browser._page.go_back(timeout=10000)
+    title = await pw_browser._page.title()
+    result = f"Back — {title}"
+    pw_browser._log_action("back", result[:80])
+    await pw_browser._take_screenshot()
+    return result
+
+
+@mcp.tool()
+async def pw_url() -> str:
+    """Get the current page URL."""
+    if not pw_browser.started:
+        return "ERROR: Browser not open. Call pw_open(url) first."
+    return pw_browser._page.url
+
+
+@mcp.tool()
+async def pw_close() -> str:
+    """Close the Playwright browser and its tmux window."""
+    if not pw_browser.started:
+        return "Browser not open"
+    await pw_browser.close()
+    _focus_window("main")
+    return "Playwright browser closed"
 
 
 # ──────────────────────────────────────────────
