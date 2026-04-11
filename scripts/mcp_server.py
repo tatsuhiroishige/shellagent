@@ -18,6 +18,7 @@ Usage:
     Claude Code launches this automatically via stdio transport.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -1450,6 +1451,7 @@ class PlaywrightBrowser:
         self._view_pane = None  # left pane — screenshot display
         self._log_pane = None   # right pane — operation log
         self._screenshot_seq = 0
+        self._anim_task = None  # current reading animation task
 
     @property
     def started(self) -> bool:
@@ -1590,28 +1592,71 @@ class PlaywrightBrowser:
         return 80, 40  # fallback
 
     async def _take_screenshot(self) -> str:
-        """Take a screenshot and display it in the left pane via chafa."""
+        """Take a JPEG screenshot and display in the left pane via imgcat.
+        Uses JPEG (smaller than PNG) for faster transfer through tmux."""
         if not self._page:
             return ""
         self._screenshot_seq += 1
-        path = os.path.join(PW_SCREENSHOT_DIR, f"pw_{self._screenshot_seq:04d}.png")
-        await self._page.screenshot(path=path)
+        path = os.path.join(PW_SCREENSHOT_DIR, f"pw_{self._screenshot_seq:04d}.jpg")
+        await self._page.screenshot(path=path, type="jpeg", quality=70)
 
         # Clean up old screenshots (keep last 20)
         if self._screenshot_seq > 20:
             old = os.path.join(PW_SCREENSHOT_DIR,
-                               f"pw_{self._screenshot_seq - 20:04d}.png")
+                               f"pw_{self._screenshot_seq - 20:04d}.jpg")
             if os.path.exists(old):
                 os.remove(old)
 
-        # Display in left pane
         if self._view_pane:
-            w, h = self._pane_size(self._view_pane)
+            # `clear` ensures clean state. With 1200ms+ intervals the flicker
+            # is minimal. Use `-n` to suppress imgcat's filename print.
             self._send_to_pane(
                 self._view_pane,
-                f"clear && chafa -f symbols -c full -w 9 --symbols braille --size {w}x{h} {shlex.quote(path)}",
+                f"clear && imgcat -n -W 100% -r {shlex.quote(path)}",
             )
         return path
+
+    def _screenshot_bg(self):
+        """Fire screenshot in background — don't await. Tool can return immediately."""
+        if self._page:
+            # Cancel pending animation so it doesn't fight with the new screenshot
+            if self._anim_task and not self._anim_task.done():
+                self._anim_task.cancel()
+            asyncio.create_task(self._take_screenshot())
+
+    async def _animate_reading(self, step_px: int = 400, delay_ms: int = 2500):
+        """Visually scroll through the page like a human reading.
+        Runs in background — does not block the caller."""
+        if not self._page:
+            return
+        try:
+            total_height = await self._page.evaluate("document.body.scrollHeight")
+            await self._page.evaluate("window.scrollTo(0, 0)")
+            # Wait for layout settle, then screenshot
+            await asyncio.sleep(0.3)
+            await self._take_screenshot()
+            scrolled = 0
+            max_steps = 5
+            for _ in range(max_steps):
+                if scrolled + step_px >= total_height:
+                    break
+                await asyncio.sleep(delay_ms / 1000)
+                # Use JS scrollBy — more reliable than mouse.wheel
+                await self._page.evaluate(f"window.scrollBy(0, {step_px})")
+                # Wait for repaint before screenshot
+                await asyncio.sleep(0.3)
+                await self._take_screenshot()
+                scrolled += step_px
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _animate_reading_bg(self):
+        """Fire reading animation in background, cancelling any prior one."""
+        if not self._page:
+            return
+        if self._anim_task and not self._anim_task.done():
+            self._anim_task.cancel()
+        self._anim_task = asyncio.create_task(self._animate_reading())
 
     def _log_action(self, action: str, detail: str = ""):
         """Append a log line to the log file (tail -f displays it in the pane)."""
@@ -1684,7 +1729,7 @@ async def pw_open(url: str) -> str:
     title = await pw_browser._page.title()
     result = f"Opened {url} — {title}"
     pw_browser._log_action("open", result[:80])
-    await pw_browser._take_screenshot()
+    pw_browser._screenshot_bg()
     return result
 
 
@@ -1698,7 +1743,7 @@ async def pw_click(selector: str) -> str:
     await pw_browser._page.click(selector, timeout=10000)
     result = f"Clicked {selector}"
     pw_browser._log_action("click", selector[:80])
-    await pw_browser._take_screenshot()
+    pw_browser._screenshot_bg()
     return result
 
 
@@ -1719,7 +1764,7 @@ async def pw_type(selector: str, text: str, clear: bool = True) -> str:
         await pw_browser._page.type(selector, text, timeout=10000)
     result = f"Typed into {selector}"
     pw_browser._log_action("type", f"{selector} <- {text[:40]}")
-    await pw_browser._take_screenshot()
+    pw_browser._screenshot_bg()
     return result
 
 
@@ -1738,27 +1783,35 @@ async def pw_scroll(direction: str = "down", amount: int = 500) -> str:
     await pw_browser._page.wait_for_timeout(300)
     result = f"Scrolled {direction} {amount}px"
     pw_browser._log_action("scroll", result)
-    await pw_browser._take_screenshot()
+    pw_browser._screenshot_bg()
     return result
 
 
 @mcp.tool()
 async def pw_text() -> str:
     """Get the visible text content of the current page.
-    Returns the text like w3m -dump but with full JS support."""
+    Returns the text like w3m -dump but with full JS support.
+    Animates page scrolling in the tmux display so the human can see what's being read."""
     if not pw_browser.started:
         return "ERROR: Browser not open. Call pw_open(url) first."
-    return await pw_browser._page.inner_text("body")
+    text = await pw_browser._page.inner_text("body")
+    pw_browser._log_action("text", f"{len(text)} chars")
+    pw_browser._animate_reading_bg()
+    return text
 
 
 @mcp.tool()
 async def pw_accessibility() -> str:
     """Get the accessibility tree of the current page.
     Returns structured text showing headings, links, buttons, inputs, etc.
-    Best way for AI to understand page structure."""
+    Best way for AI to understand page structure.
+    Animates page scrolling in the tmux display so the human can see what's being read."""
     if not pw_browser.started:
         return "ERROR: Browser not open. Call pw_open(url) first."
-    return await pw_browser._page.locator("body").aria_snapshot()
+    snapshot = await pw_browser._page.locator("body").aria_snapshot()
+    pw_browser._log_action("accessibility", f"{len(snapshot)} chars")
+    pw_browser._animate_reading_bg()
+    return snapshot
 
 
 @mcp.tool()
@@ -1769,7 +1822,7 @@ async def pw_screenshot() -> str:
     pw_browser._ensure_window()
     _focus_window(PW_WINDOW)
     pw_browser._log_action("screenshot", "manual")
-    await pw_browser._take_screenshot()
+    pw_browser._screenshot_bg()
     return "Screenshot updated"
 
 
@@ -1782,7 +1835,7 @@ async def pw_eval(js: str) -> str:
     pw_browser._ensure_window()
     result = await pw_browser._page.evaluate(js)
     pw_browser._log_action("eval", js[:60])
-    await pw_browser._take_screenshot()
+    pw_browser._screenshot_bg()
     return json.dumps(result, ensure_ascii=False, default=str)
 
 
@@ -1796,7 +1849,7 @@ async def pw_back() -> str:
     title = await pw_browser._page.title()
     result = f"Back — {title}"
     pw_browser._log_action("back", result[:80])
-    await pw_browser._take_screenshot()
+    pw_browser._screenshot_bg()
     return result
 
 
@@ -1816,6 +1869,79 @@ async def pw_close() -> str:
     await pw_browser.close()
     _focus_window("main")
     return "Playwright browser closed"
+
+
+@mcp.tool()
+async def pw_select(selector: str, value: str) -> str:
+    """Select an option from a <select> dropdown.
+    Args:
+        selector: CSS selector for the <select> element
+        value: option value or visible label to select
+    """
+    await pw_browser._ensure_started()
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    await pw_browser._page.select_option(selector, value, timeout=10000)
+    result = f"Selected '{value}' in {selector}"
+    pw_browser._log_action("select", f"{selector} = {value[:40]}")
+    pw_browser._screenshot_bg()
+    return result
+
+
+@mcp.tool()
+async def pw_download(selector: str, save_dir: str = "") -> str:
+    """Click a download link/button and save the file.
+    Args:
+        selector: CSS selector for the element that triggers the download
+        save_dir: directory to save to (default: ~/Downloads)
+    Returns the path to the saved file."""
+    await pw_browser._ensure_started()
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    if not save_dir:
+        save_dir = os.path.expanduser("~/Downloads")
+    os.makedirs(save_dir, exist_ok=True)
+    async with pw_browser._page.expect_download(timeout=30000) as download_info:
+        await pw_browser._page.click(selector, timeout=10000)
+    download = await download_info.value
+    filename = download.suggested_filename
+    save_path = os.path.join(save_dir, filename)
+    await download.save_as(save_path)
+    result = f"Downloaded {filename} → {save_path}"
+    pw_browser._log_action("download", result[:80])
+    pw_browser._screenshot_bg()
+    return result
+
+
+@mcp.tool()
+async def pw_pdf(path: str, page_num: int = 1) -> str:
+    """Display a PDF file in the tmux pane using imgcat.
+    Converts PDF to PNG via sips (macOS built-in) and displays with imgcat.
+    Args:
+        path: path to the PDF file
+        page_num: page number to display (default: 1)
+    """
+    pw_browser._ensure_window()
+    _focus_window(PW_WINDOW)
+    resolved = os.path.expanduser(path)
+    if not os.path.exists(resolved):
+        return f"ERROR: File not found: {resolved}"
+    os.makedirs(PW_SCREENSHOT_DIR, exist_ok=True)
+    out_path = os.path.join(PW_SCREENSHOT_DIR, "pdf_view.png")
+    # sips converts PDF first page to PNG (macOS built-in)
+    r = subprocess.run(
+        ["sips", "-s", "format", "png", resolved, "--out", out_path],
+        capture_output=True, text=True, timeout=15,
+    )
+    if r.returncode != 0:
+        return f"ERROR: sips failed: {r.stderr}"
+    if pw_browser._view_pane:
+        pw_browser._send_to_pane(
+            pw_browser._view_pane,
+            f"clear && imgcat -W 100% -r {shlex.quote(out_path)}",
+        )
+    pw_browser._log_action("pdf", f"{path} p.{page_num}")
+    return f"Displaying {path}"
 
 
 # ──────────────────────────────────────────────

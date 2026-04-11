@@ -97,6 +97,9 @@ tmux上で動作する透明・低コストなAIエージェント基盤。
 | `pw_back()` | 戻る |
 | `pw_url()` | 現在のURL取得 |
 | `pw_close()` | ブラウザ終了 |
+| `pw_select(selector, value)` | ドロップダウン選択 |
+| `pw_download(selector, save_dir)` | ファイルダウンロード（デフォルト~/Downloads） |
+| `pw_pdf(path, page_num)` | PDFをブラウザで開いてimgcat表示 |
 
 tmux上の `pwbrowse` ウィンドウに2ペイン表示:
 - 左 (65%): chafaでスクリーンショット表示（操作ごとに自動更新）
